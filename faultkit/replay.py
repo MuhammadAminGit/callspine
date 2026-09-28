@@ -1,19 +1,29 @@
-"""Fire realistic webhook sequences at a running callspine, with faults injected.
+"""Replay realistic call sequences at a running callspine, with delivery faults injected.
 
-Both Vapi and Retell deliver over the public internet with at-least-once semantics.
-That means duplicates, reordering and late arrivals are not edge cases you might hit,
-they are the normal operating condition. The only question is whether your backend was
-written as though they were.
+Retell retries any webhook that does not get a 2xx within ten seconds, up to three times,
+and retries custom functions up to five times if configured to. Vapi documents no retry
+policy. Separately from the transport, an LLM can simply call the same tool twice. The
+question is only whether the backend was written as if all of that were normal.
 
-This harness makes those conditions reproducible. Point it at a running server and it
-replays a scripted call while doing the things the internet does:
+    python faultkit/replay.py --provider vapi   --fault retry-tool --calls 5
+    python faultkit/replay.py --provider retell --fault all        --calls 10
 
-    python faultkit/replay.py --provider retell --fault duplicate
-    python faultkit/replay.py --provider vapi --fault reorder
-    python faultkit/replay.py --provider retell --fault all --calls 5
+Faults:
 
-Then read /api/anomalies and see whether the system noticed. A backend that survives
-this cleanly is one you can put a business's phone number on.
+    duplicate    redeliver one lifecycle webhook
+    retry-tool   redeliver the tool invocation, same id (a transport retry)
+    reissue-tool the model calls the tool again with a new id (Vapi only)
+    reorder      swap two adjacent deliveries
+    delay        sleep between some deliveries
+    tamper       sign one body and send another
+    all          every one of the above
+
+The check is exactly-once, not at-most-once: every call whose booking request got
+through must end up with exactly one booking, and no call may have two. Exit codes:
+0 held, 1 violated, 2 no server, 3 inconclusive (a slot was already taken by an earlier
+run; use a fresh database), 4 setup error such as a missing or wrong API token. Setup
+problems get their own code so a misconfigured CI job never reads as a correctness bug.
+Anomaly counts cover this run's calls only.
 """
 
 from __future__ import annotations
@@ -23,201 +33,216 @@ import json
 import random
 import sys
 import time
-from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from callspine.providers.base import hmac_sha256_hex
+from callspine.tools import SLOTS
 
-FAULTS = ("none", "duplicate", "reorder", "delay", "tamper", "all")
+FAULTS = ("none", "duplicate", "retry-tool", "reissue-tool", "reorder", "delay", "tamper", "all")
+
+# Each provider books from its own half of the week, so runs against one database do
+# not compete for slots.
+SLOT_OFFSET = {"vapi": 0, "retell": len(SLOTS) // 2}
+
+
+@dataclass
+class Delivery:
+    path: str
+    body: dict[str, Any]
+    is_tool: bool = False
+    is_lifecycle: bool = False
+    tamper: bool = False
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# --- payload builders -------------------------------------------------------
+# ---- sequences, shaped like each provider's documentation ------------------------------
 
 
-def vapi_sequence(call_id: str) -> list[dict[str, Any]]:
+def vapi_call(call_id: str, slot: str) -> list[Delivery]:
     def msg(mtype: str, **extra: Any) -> dict[str, Any]:
-        return {
-            "message": {
-                "type": mtype,
-                "timestamp": now_ms(),
-                "call": {"id": call_id},
-                **extra,
-            }
-        }
+        return {"message": {"type": mtype, "timestamp": now_ms(),
+                            "call": {"id": call_id, "type": "inboundPhoneCall"}, **extra}}
 
+    def status(s: str) -> Delivery:
+        return Delivery("/webhooks/vapi", msg("status-update", status=s), is_lifecycle=True)
+
+    tool = {"id": f"tc_{call_id}", "type": "function",
+            "function": {"name": "book_appointment", "arguments": {"slot": slot}}}
     return [
-        msg("status-update", status="queued"),
-        msg("status-update", status="ringing"),
-        msg("status-update", status="in-progress"),
-        msg("speech-update", role="assistant"),
-        msg("transcript", transcript="hi, I'd like to book an appointment"),
-        msg("tool-calls", toolCalls=[{"name": "check_availability"}]),
-        msg("transcript", transcript="Tuesday at ten works"),
-        msg("status-update", status="ended"),
-        msg("end-of-call-report", endedReason="customer-ended-call"),
+        status("queued"),
+        status("ringing"),
+        status("in-progress"),
+        Delivery("/webhooks/vapi", msg("speech-update", status="started", role="assistant", turn=1)),
+        Delivery("/webhooks/vapi", msg("transcript", role="user", transcriptType="final",
+                                       transcript=f"{slot} works for me")),
+        Delivery("/webhooks/vapi", msg("tool-calls", toolCallList=[tool]), is_tool=True),
+        status("ended"),
+        Delivery("/webhooks/vapi", msg("end-of-call-report", endedReason="customer-ended-call"),
+                 is_lifecycle=True),
     ]
 
 
-def retell_sequence(call_id: str) -> list[dict[str, Any]]:
-    def msg(event: str, **extra: Any) -> dict[str, Any]:
-        return {"event": event, "call": {"call_id": call_id}, **extra}
+def retell_call(call_id: str, slot: str) -> list[Delivery]:
+    call = {"call_id": call_id, "agent_id": "agent_demo", "start_timestamp": now_ms()}
+
+    def event(name: str, **extra: Any) -> dict[str, Any]:
+        return {"event": name, "call": {**call, **extra}}
 
     return [
-        msg("call_started"),
-        msg("call_ringing"),
-        msg("call_answered"),
-        msg("agent_response", response="thanks for calling, how can I help?"),
-        msg("transcript_update", transcript="I need an appointment"),
-        msg("tool_call", tool="check_availability"),
-        msg("tool_result", result={"slots": 5}),
-        msg("call_ended", disconnection_reason="user_hangup"),
+        Delivery("/webhooks/retell", event("call_started", call_status="ongoing"), is_lifecycle=True),
+        Delivery("/webhooks/retell", event("transcript_updated", transcript="Agent: Hi.")),
+        Delivery("/tools/retell", {"name": "book_appointment", "args": {"slot": slot}, "call": call},
+                 is_tool=True),
+        Delivery("/webhooks/retell", event("transcript_updated", transcript=f"User: {slot}.")),
+        Delivery("/webhooks/retell", event("call_ended", call_status="ended"), is_lifecycle=True),
+        Delivery("/webhooks/retell", event("call_analyzed", call_status="ended"), is_lifecycle=True),
     ]
 
 
-# --- signing ----------------------------------------------------------------
+# ---- signing ---------------------------------------------------------------------------
 
 
-def sign_vapi(body: bytes, secret: str) -> dict[str, str]:
-    ts = str(now_ms())
-    return {
-        "x-timestamp": ts,
-        "x-vapi-signature": hmac_sha256_hex(secret, ts.encode() + b"." + body),
-        "content-type": "application/json",
-    }
-
-
-def sign_retell(body: bytes, api_key: str) -> dict[str, str]:
+def sign(provider: str, body: bytes, secret: str) -> dict[str, str]:
+    """Signed at send time, as a real sender would sign each attempt."""
+    if provider == "vapi":
+        return {"x-signature": hmac_sha256_hex(secret, body), "content-type": "application/json"}
     ts = now_ms()
-    digest = hmac_sha256_hex(api_key, body + str(ts).encode())
-    return {
-        "x-retell-signature": f"v={ts},d={digest}",
-        "content-type": "application/json",
-    }
+    digest = hmac_sha256_hex(secret, body + str(ts).encode())
+    return {"x-retell-signature": f"v={ts},d={digest}", "content-type": "application/json"}
 
 
-# --- fault injection --------------------------------------------------------
+# ---- faults ------------------------------------------------------------------------------
 
 
-def apply_faults(
-    payloads: list[dict[str, Any]], fault: str, rng: random.Random
-) -> list[tuple[dict[str, Any], bool]]:
-    """Return (payload, tamper) pairs in delivery order.
+def inject(items: list[Delivery], fault: str, rng: random.Random) -> list[Delivery]:
+    items = list(items)
+    on = {f: fault in (f, "all") for f in ("duplicate", "retry-tool", "reissue-tool", "reorder", "tamper")}
 
-    `duplicate` redelivers a middle event, mimicking a provider retry after our 200
-    arrived too slowly to be recorded on their side.
+    if on["duplicate"]:
+        i = rng.choice([n for n, d in enumerate(items) if d.is_lifecycle])
+        items.insert(i + 1, items[i])
 
-    `reorder` swaps two adjacent events, which is what happens when two deliveries take
-    different paths and the later one wins the race.
-    """
-    items: list[tuple[dict[str, Any], bool]] = [(p, False) for p in payloads]
+    if on["retry-tool"]:
+        i = next(n for n, d in enumerate(items) if d.is_tool)
+        items.insert(i + 1, items[i])
 
-    do = {f: fault in (f, "all") for f in ("duplicate", "reorder", "tamper")}
+    if on["reissue-tool"] and items[0].path == "/webhooks/vapi":
+        i = next(n for n, d in enumerate(items) if d.is_tool)
+        again = json.loads(json.dumps(items[i].body))
+        call = again["message"]["toolCallList"][0]
+        call["id"] = call["id"] + "-again"
+        items.insert(i + 1, Delivery(items[i].path, again, is_tool=True))
 
-    if do["duplicate"] and len(items) > 3:
-        idx = rng.randrange(1, len(items) - 1)
-        items.insert(idx + 1, items[idx])
-
-    if do["reorder"] and len(items) > 4:
-        i = rng.randrange(1, len(items) - 2)
+    if on["reorder"]:
+        i = rng.randrange(1, len(items) - 1)
         items[i], items[i + 1] = items[i + 1], items[i]
 
-    if do["tamper"] and items:
-        idx = rng.randrange(len(items))
-        items[idx] = (items[idx][0], True)
+    if on["tamper"]:
+        i = rng.randrange(len(items))
+        d = items[i]
+        items[i] = Delivery(d.path, d.body, d.is_tool, d.is_lifecycle, tamper=True)
 
     return items
 
 
-def deliver(
-    client: httpx.Client,
-    base_url: str,
-    provider: str,
-    payload: dict[str, Any],
-    signer: Callable[[bytes], dict[str, str]],
-    tamper: bool,
-) -> tuple[int, str]:
-    body = json.dumps(payload).encode()
-    headers = signer(body)
-    if tamper:
-        # Sign the real body, then send a different one. This is exactly what a
-        # man-in-the-middle or a buggy proxy that rewrites JSON looks like.
-        body = body.replace(b"call_id", b"call_1d").replace(b'"id"', b'"1d"')
-    resp = client.post(f"{base_url}/webhooks/{provider}", content=body, headers=headers)
-    return resp.status_code, resp.text[:200]
+def _read(client: httpx.Client, path: str, headers: dict[str, str]) -> list[dict[str, Any]]:
+    r = client.get(path, headers=headers)
+    r.raise_for_status()
+    return r.json()
 
 
 def run(args: argparse.Namespace) -> int:
     rng = random.Random(args.seed)
-    builder = vapi_sequence if args.provider == "vapi" else retell_sequence
-    secret = args.secret
-    signer = (
-        (lambda b: sign_vapi(b, secret))
-        if args.provider == "vapi"
-        else (lambda b: sign_retell(b, secret))
-    )
+    build = vapi_call if args.provider == "vapi" else retell_call
+    sent = {"2xx": 0, "401": 0, "other": 0}
+    call_ids: list[str] = []
+    slots: dict[str, str] = {}
+    expected: dict[str, bool] = {}
 
-    totals = {"sent": 0, "2xx": 0, "401": 0, "other": 0}
-
-    with httpx.Client(timeout=10.0) as client:
+    auth = {"authorization": f"Bearer {args.api_token}"}
+    with httpx.Client(base_url=args.base_url, timeout=15.0) as client:
         try:
-            client.get(f"{args.base_url}/healthz")
+            client.get("/healthz")
         except httpx.ConnectError:
-            print(f"no server at {args.base_url}. start it with: make dev", file=sys.stderr)
+            print(f"no server at {args.base_url}; start one with `make dev`", file=sys.stderr)
             return 2
 
         for n in range(args.calls):
             call_id = f"{args.provider}-{args.seed}-{n}"
-            items = apply_faults(builder(call_id), args.fault, rng)
-            print(f"\ncall {call_id}  ({len(items)} deliveries, fault={args.fault})")
+            call_ids.append(call_id)
+            slot = SLOTS[(SLOT_OFFSET[args.provider] + args.seed + n) % len(SLOTS)]
+            slots[call_id] = slot
+            plan = inject(build(call_id, slot), args.fault, rng)
+            # A call should book if at least one of its booking requests was not tampered.
+            expected[call_id] = any(d.is_tool and not d.tamper for d in plan)
+            print(f"\n{call_id}  {len(plan)} deliveries  fault={args.fault}")
 
-            for payload, tamper in items:
-                if args.fault in ("delay", "all") and rng.random() < 0.3:
-                    time.sleep(rng.uniform(0.2, 1.2))
+            for d in plan:
+                if args.fault in ("delay", "all") and rng.random() < 0.25:
+                    time.sleep(rng.uniform(0.1, 0.8))
+                body = json.dumps(d.body).encode()
+                headers = sign(args.provider, body, args.secret)
+                if d.tamper:
+                    body = body.replace(b"call", b"cal1", 1)
+                r = client.post(d.path, content=body, headers=headers)
+                bucket = "2xx" if r.is_success else "401" if r.status_code == 401 else "other"
+                sent[bucket] += 1
+                label = ("TAMPERED " if d.tamper else "") + ("tool " if d.is_tool else "")
+                print(f"  {r.status_code}  {label}{d.path}  {r.text[:90]}")
 
-                status, snippet = deliver(
-                    client, args.base_url, args.provider, payload, signer, tamper
-                )
-                totals["sent"] += 1
-                if 200 <= status < 300:
-                    totals["2xx"] += 1
-                elif status == 401:
-                    totals["401"] += 1
-                else:
-                    totals["other"] += 1
+        try:
+            bookings = _read(client, "/api/bookings", auth)
+            anomalies = _read(client, "/api/anomalies", auth)
+        except httpx.HTTPStatusError as exc:
+            print(f"\nSETUP ERROR: {exc.request.url.path} returned {exc.response.status_code}: "
+                  f"{exc.response.text[:120]}\nIs the server's CALLSPINE_API_TOKEN the same as "
+                  "--api-token?", file=sys.stderr)
+            return 4
 
-                label = "TAMPERED " if tamper else ""
-                print(f"  {label}{status}  {snippet}")
+    print(f"\nsent  2xx={sent['2xx']}  401={sent['401']}  other={sent['other']}")
 
-        anomalies = client.get(f"{args.base_url}/api/anomalies").json()
+    mine = {c: [b for b in bookings if b["call_ref"] == c] for c in call_ids}
+    owner = {b["slot"]: b["call_ref"] for b in bookings}
 
-    print(f"\ndelivered={totals['sent']}  2xx={totals['2xx']}  "
-          f"401={totals['401']}  other={totals['other']}")
-
-    by_kind: dict[str, int] = {}
+    counts: dict[str, int] = {}
     for a in anomalies:
-        by_kind[a["kind"]] = by_kind.get(a["kind"], 0) + 1
-    print("\nanomalies recorded:")
-    if not by_kind:
-        print("  (none)")
-    for kind, count in sorted(by_kind.items(), key=lambda kv: -kv[1]):
+        if a["call_ref"] in mine:
+            counts[a["kind"]] = counts.get(a["kind"], 0) + 1
+    print("\nanomalies recorded for these calls:")
+    for kind, count in sorted(counts.items(), key=lambda kv: -kv[1]) or [("(none)", 0)]:
         print(f"  {count:>4}  {kind}")
 
+    doubled = [c for c in call_ids if len(mine[c]) > 1]
+    missing = [c for c in call_ids if expected[c] and not mine[c] and slots[c] not in owner]
+    blocked = [c for c in call_ids if expected[c] and not mine[c] and slots[c] in owner]
+    booked = sum(1 for c in call_ids if len(mine[c]) == 1)
+    should = sum(expected.values())
+
+    print(f"\nbookings: {booked} of {should} expected, {len(doubled)} doubled, {len(missing)} missing")
+    if doubled or missing:
+        print(f"EXACTLY-ONCE VIOLATED: doubled={doubled} missing={missing}")
+        return 1
+    if blocked:
+        print(f"INCONCLUSIVE: slots already booked by an earlier run for {blocked}; use a fresh database")
+        return 3
+    print("exactly-once: held")
     return 0
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--provider", choices=("vapi", "retell"), default="retell")
-    p.add_argument("--fault", choices=FAULTS, default="none")
-    p.add_argument("--calls", type=int, default=1)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--provider", choices=("vapi", "retell"), default="vapi")
+    p.add_argument("--fault", choices=FAULTS, default="all")
+    p.add_argument("--calls", type=int, default=3)
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
     p.add_argument("--secret", default="dev-secret", help="VAPI_SECRET or RETELL_API_KEY")
+    p.add_argument("--api-token", default="dev-token", help="CALLSPINE_API_TOKEN")
     p.add_argument("--seed", type=int, default=1)
     return run(p.parse_args())
 
