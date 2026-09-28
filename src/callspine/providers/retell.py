@@ -1,22 +1,33 @@
 """Retell adapter.
 
-Retell's scheme is fixed, which makes it easier to get right and easier to get subtly
-wrong in exactly one way.
+Everything here follows Retell's own documentation, linked in the README.
 
-Fixed parts:
-- HMAC-SHA256, keyed with your Retell **API key** (the one carrying the webhook badge,
-  not just any key).
-- Header `x-retell-signature`, shaped `v={unix_ms_timestamp},d={hex_digest}`.
-- The digest covers the raw body together with that timestamp, so the timestamp is
-  bound into the signature and cannot be edited independently.
+Authentication. HMAC-SHA256 keyed with the Retell API key (the one carrying the webhook
+badge), sent as `x-retell-signature: v={unix_ms},d={hex_digest}`, where the digest covers
+the raw body followed by the timestamp. Retell documents a five-minute replay window. The
+timestamp is bound into the signature, but nothing forces a receiver to check its age, so
+this adapter enforces the window by default and makes disabling it an explicit choice.
 
-The one way to get it wrong: treating the replay window as optional. The timestamp is
-*authenticated*, but nothing forces you to look at it. Skip the window check and a
-captured request stays replayable for as long as the API key lives. This adapter
-enforces it by default and makes disabling it an explicit argument, because a default
-that silently weakens security is worse than no default.
+Idempotency. Retell is unusually specific, and its guidance differs by event class:
 
-Compare `vapi.py`, where the scheme itself is yours to define.
+- lifecycle events (`call_started`, `call_ended`, `call_analyzed`): `event` + `call_id`
+- transfer events: `event` + `call_id` + `start_timestamp`, and `transfer_destination`
+  if needed
+- `transcript_updated`: do not deduplicate by `call_id` at all; it is a stream of
+  incremental updates
+
+One ambiguity: the docs do not say whether a transfer's `start_timestamp` is the
+transfer's or the call's. This adapter prefers a top-level one and falls back to the
+call's. If it is the call's, two transfer attempts to the same destination in one call
+would share a key.
+
+The obvious-looking alternative, the signature timestamp, is not documented as stable
+across deliveries, and a sender that signs at send time gives every retry a new one.
+Keying on it makes each retry look like a new event.
+
+Tools. Retell custom functions carry no per-invocation id and may be retried up to five
+times, and Retell's docs say the endpoint "must be idempotent". So exactly-once for Retell
+cannot be done by remembering an id; it has to be a property of the operation itself.
 """
 
 from __future__ import annotations
@@ -28,25 +39,29 @@ from typing import Any
 from callspine.domain import EventType, NormalizedEvent, Provider
 from callspine.providers.base import (
     SignatureError,
+    ToolInvocation,
+    body_hash_key,
     constant_time_eq,
     hmac_sha256_hex,
-    synthetic_event_id,
     within_replay_window,
 )
 
+SIGNATURE_HEADER = "x-retell-signature"
+
 _EVENT_MAP: dict[str, EventType] = {
     "call_started": EventType.CALL_STARTED,
-    "call_ringing": EventType.CALL_RINGING,
-    "call_answered": EventType.CALL_ANSWERED,
     "call_ended": EventType.CALL_ENDED,
-    "call_analyzed": EventType.UNKNOWN,  # post-call analysis, not a lifecycle change
-    "agent_response": EventType.TRANSCRIPT,
-    "transcript_update": EventType.TRANSCRIPT,
-    "tool_call": EventType.TOOL_INVOKED,
-    "tool_result": EventType.TOOL_RESULT,
+    "call_analyzed": EventType.CALL_REPORT,
+    "transcript_updated": EventType.TRANSCRIPT,
+    "transfer_started": EventType.TRANSFER,
+    "transfer_bridged": EventType.TRANSFER,
+    "transfer_cancelled": EventType.TRANSFER,
+    "transfer_ended": EventType.TRANSFER,
 }
 
-SIGNATURE_HEADER = "x-retell-signature"
+_LIFECYCLE = frozenset({"call_started", "call_ended", "call_analyzed"})
+_TRANSFER = frozenset({"transfer_started", "transfer_bridged", "transfer_cancelled", "transfer_ended"})
+_STREAM = frozenset({"transcript_updated"})
 
 
 @dataclass
@@ -59,16 +74,15 @@ class RetellConfig:
 def parse_signature_header(value: str) -> tuple[int, str]:
     """Pull the timestamp and digest out of `v={ts},d={digest}`.
 
-    Tolerates whitespace and reordering, because a parser that only accepts the exact
+    Tolerates whitespace and field order, because a parser that accepts only the exact
     documented byte sequence breaks the first time a vendor adds a field.
     """
-    parts = [p.strip() for p in value.split(",") if p.strip()]
     ts: int | None = None
     digest: str | None = None
-    for part in parts:
-        if "=" not in part:
+    for part in (p.strip() for p in value.split(",")):
+        key, sep, val = part.partition("=")
+        if not sep:
             continue
-        key, _, val = part.partition("=")
         key = key.strip().lower()
         if key == "v":
             try:
@@ -89,6 +103,7 @@ class RetellAdapter:
         self.config = config
 
     def verify(self, raw_body: bytes, headers: dict[str, str]) -> None:
+        """Used for both webhooks and custom-function calls; Retell signs them the same way."""
         if not self.config.api_key:
             raise SignatureError("no retell api key configured")
 
@@ -111,44 +126,67 @@ class RetellAdapter:
         self, raw_body: bytes, headers: dict[str, str], received_ts_ms: int
     ) -> list[NormalizedEvent]:
         body: dict[str, Any] = json.loads(raw_body)
+        event = str(body.get("event", ""))
+        call: dict[str, Any] = body.get("call") or {}
 
-        raw_type = str(body.get("event", ""))
-        etype = _EVENT_MAP.get(raw_type, EventType.UNKNOWN)
-
-        call = body.get("call") or {}
-        call_ref = str(call.get("call_id") or body.get("call_id") or "")
+        call_ref = str(call.get("call_id") or "")
         if not call_ref:
-            raise ValueError("retell payload has no call_id")
-
-        # The signature timestamp looks like an obvious idempotency key and is a trap.
-        # A redelivery is re-signed at the moment it is retried, so the same event
-        # arrives twice carrying two different timestamps. Keying on it makes every
-        # retry look like a fresh event, which is exactly the double-booking bug this
-        # layer exists to prevent. Found by faultkit, not by reading the docs.
-        #
-        # So dedupe on the body, like Vapi. The known cost is that two genuinely
-        # distinct events with byte-identical payloads collapse into one. In this
-        # vocabulary that means a repeated identical transcript line, which is a far
-        # cheaper failure than a duplicated booking.
-        event_id = synthetic_event_id(self.name, raw_body)
-
-        # The timestamp is still worth keeping: signed by the provider, it gives a
-        # trustworthy provider-side clock for measuring delivery lag.
-        try:
-            provider_ts_ms: int | None = parse_signature_header(
-                headers.get(SIGNATURE_HEADER, "")
-            )[0]
-        except SignatureError:
-            provider_ts_ms = None
+            raise ValueError(f"retell {event!r} payload has no call.call_id")
 
         return [
             NormalizedEvent(
                 provider=Provider.RETELL,
-                provider_event_id=event_id,
                 call_ref=call_ref,
-                type=etype,
-                provider_ts_ms=provider_ts_ms,
+                type=_EVENT_MAP.get(event, EventType.UNKNOWN),
+                dedupe_key=_dedupe_key(event, call_ref, body, call, raw_body),
+                provider_ts_ms=_signed_timestamp(headers),
                 received_ts_ms=received_ts_ms,
-                payload={"raw_type": raw_type, "body": body},
+                raw_type=event,
+                payload=body,
             )
         ]
+
+    def parse_function_call(self, raw_body: bytes) -> ToolInvocation:
+        """Read a custom-function request: `{"name", "args", "call"}`.
+
+        Requires Retell's default payload mode. With "args only" enabled the body carries
+        neither the function name nor the call, so there is nothing to attribute it to.
+        """
+        body: dict[str, Any] = json.loads(raw_body)
+        name = body.get("name")
+        call = body.get("call") or {}
+        if not name or not call.get("call_id"):
+            raise ValueError(
+                "retell function request needs name and call.call_id; "
+                "is 'args only' payload mode enabled?"
+            )
+        args = body.get("args") or {}
+        return ToolInvocation(
+            call_ref=str(call["call_id"]),
+            name=str(name),
+            args=args if isinstance(args, dict) else {},
+            invocation_id=None,
+        )
+
+
+def _dedupe_key(
+    event: str, call_ref: str, body: dict[str, Any], call: dict[str, Any], raw_body: bytes
+) -> str | None:
+    if event in _STREAM:
+        return None
+    if event in _LIFECYCLE:
+        return f"{event}:{call_ref}"
+    if event in _TRANSFER:
+        start = body.get("start_timestamp", call.get("start_timestamp", ""))
+        dest = body.get("transfer_destination")
+        dest_part = json.dumps(dest, sort_keys=True) if dest is not None else ""
+        return f"{event}:{call_ref}:{start}:{dest_part}"
+    return body_hash_key(event, raw_body)
+
+
+def _signed_timestamp(headers: dict[str, str]) -> int | None:
+    """Retell's signature timestamp: authenticated, so trustworthy for measuring lag."""
+    try:
+        return parse_signature_header(headers.get(SIGNATURE_HEADER, ""))[0]
+    except SignatureError:
+        return None

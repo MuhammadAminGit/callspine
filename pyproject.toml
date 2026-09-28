@@ -1,6 +1,6 @@
 [project]
 name = "callspine"
-version = "0.1.0"
+version = "0.2.0"
 description = "The reliability layer under hosted voice-agent platforms. One backend, two providers, provable behaviour under failure."
 requires-python = ">=3.11"
 dependencies = [
@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.7"]
+dev = ["pytest>=8.3", "ruff>=0.7", "httpx2"]
 
 [build-system]
 requires = ["hatchling"]
@@ -25,5 +25,4 @@ line-length = 100
 target-version = "py311"
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
-asyncio_mode = "auto"
+pythonpath = ["src", "."]

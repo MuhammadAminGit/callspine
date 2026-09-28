@@ -1,15 +1,16 @@
-"""The path every webhook takes: verify, normalize, dedupe, advance state, record.
+"""The path every webhook takes: dedupe, advance state, measure, record.
 
-Each stage can fail in a way that is *expected* rather than exceptional, and the
-difference between a system you can debug and one you cannot is whether those
-expected failures get written down. Duplicates, illegal transitions, unmapped event
-types and post-hangup chatter all land in the anomalies table instead of being
-swallowed or crashing the request.
+Several stages fail in ways that are expected rather than exceptional: duplicates,
+illegal transitions, unmapped event types, chatter after hangup. The difference between
+a system you can debug and one you cannot is whether those get written down. They all
+land in the anomalies table instead of being swallowed or crashing the request.
 
-Returning 200 for an authenticated-but-unprocessable event is deliberate. Both
-providers retry non-2xx responses, so returning 500 for a payload that will never
-parse turns one bad event into an infinite retry storm. Authentication failures do
-return 401, because those should not be retried and should be loud.
+Each event is processed in a single transaction. If anything fails partway, the event is
+not left marked as seen, so the provider's retry is processed rather than discarded as a
+duplicate. The transaction also holds SQLite's write lock, which is what makes it safe
+for several workers to share one database: two events for the same call cannot both
+read the old state and both write over each other. That lock is database-wide, so every
+event is serialized, not only those for the same call.
 """
 
 from __future__ import annotations
@@ -22,21 +23,14 @@ from callspine.domain import (
     CallStateMachine,
     EventType,
     NormalizedEvent,
+    Provider,
     TransitionRejected,
 )
-from callspine.store import Store, now_ms
+from callspine.store import Store
 
-# Events that open or close a measurable phase of the call.
-_SPAN_OPENERS: dict[EventType, str] = {
-    EventType.CALL_RINGING: "ring_to_answer",
-    EventType.CALL_ANSWERED: "answer_to_first_speech",
-    EventType.TOOL_INVOKED: "tool_roundtrip",
-}
-_SPAN_CLOSERS: dict[EventType, str] = {
-    EventType.CALL_ANSWERED: "ring_to_answer",
-    EventType.SPEECH_STARTED: "answer_to_first_speech",
-    EventType.TOOL_RESULT: "tool_roundtrip",
-}
+# Only Vapi reports when the assistant starts speaking, so only Vapi calls can measure
+# time to first word. Opening that span for Retell would flag every call as unfinished.
+_REPORTS_AGENT_SPEECH = frozenset({Provider.VAPI})
 
 
 @dataclass
@@ -48,39 +42,27 @@ class IngestResult:
     call_state: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            "accepted": self.accepted,
-            "duplicates": self.duplicates,
-            "rejected_transitions": self.rejected_transitions,
-            "unknown_events": self.unknown_events,
-            "call_state": self.call_state,
-        }
+        return self.__dict__.copy()
 
 
 class Ingestor:
     def __init__(self, store: Store) -> None:
         self.store = store
-        self._open_spans: dict[tuple[str, str], int] = {}
 
     def handle(self, events: list[NormalizedEvent]) -> IngestResult:
         result = IngestResult()
         for event in events:
-            self._handle_one(event, result)
+            with self.store.transaction():
+                self._handle_one(event, result)
         return result
 
     def _handle_one(self, event: NormalizedEvent, result: IngestResult) -> None:
         provider = event.provider.value
 
-        # 1. Dedupe first. Everything after this must be safe to skip entirely.
         if not self.store.record_event(event):
             result.duplicates += 1
-            lag = event.delivery_lag_ms
             self.store.record_anomaly(
-                provider,
-                "duplicate_delivery",
-                f"{event.type.value} redelivered"
-                + (f" after {lag}ms" if lag is not None else ""),
-                event.call_ref,
+                provider, "duplicate_delivery", f"{event.raw_type} delivered again", event.call_ref
             )
             return
 
@@ -89,80 +71,85 @@ class Ingestor:
         if event.type is EventType.UNKNOWN:
             result.unknown_events += 1
             self.store.record_anomaly(
-                provider,
-                "unmapped_event",
-                f"no mapping for provider type {event.payload.get('raw_type')!r}",
-                event.call_ref,
+                provider, "unmapped_event", f"no mapping for {event.raw_type!r}", event.call_ref
             )
 
-        # 2. Advance the call, refusing to clobber on out-of-order delivery.
         current = self.store.get_state(event.call_ref) or CallState.PENDING
         machine = CallStateMachine(state=current)
         try:
             new_state = machine.apply(event)
         except TransitionRejected as exc:
             result.rejected_transitions += 1
-            self.store.record_anomaly(
-                provider, "illegal_transition", str(exc), event.call_ref
-            )
+            self.store.record_anomaly(provider, "illegal_transition", str(exc), event.call_ref)
             result.call_state = current.value
             return
 
-        for note in machine.anomalies:
-            self.store.record_anomaly(provider, "post_hangup_event", note, event.call_ref)
+        for kind, detail in machine.notes:
+            self.store.record_anomaly(provider, kind, detail, event.call_ref)
 
         self.store.upsert_call(event.call_ref, provider, new_state)
         result.call_state = new_state.value
 
-        # 3. Latency accounting.
-        self._update_spans(event)
+        ended_now = current is not CallState.ENDED and new_state is CallState.ENDED
+        self._update_spans(event, ended_now=ended_now)
 
-    def _update_spans(self, event: NormalizedEvent) -> None:
-        closer = _SPAN_CLOSERS.get(event.type)
-        if closer:
-            span_id = self._open_spans.pop((event.call_ref, closer), None)
-            if span_id is not None:
-                self.store.close_span(span_id)
+    def _update_spans(self, event: NormalizedEvent, *, ended_now: bool) -> None:
+        # The provider's clock where it sends one, so delivery jitter stays out of the
+        # measurement. Either way this is webhook timing: a close proxy for what the
+        # caller experienced, not a measurement of the audio.
+        ts = event.provider_ts_ms if event.provider_ts_ms is not None else event.received_ts_ms
+        ref, attrs = event.call_ref, {"provider": event.provider.value}
 
-        opener = _SPAN_OPENERS.get(event.type)
-        if opener and (event.call_ref, opener) not in self._open_spans:
-            self._open_spans[(event.call_ref, opener)] = self.store.open_span(
-                event.call_ref,
-                opener,
-                {"provider": event.provider.value, "opened_by": event.type.value},
-            )
-
-        if event.type is EventType.CALL_ENDED:
-            # Close anything still open so a dropped call does not leave a span that
-            # looks infinitely long in the dashboard.
-            for (call_ref, name), span_id in list(self._open_spans.items()):
-                if call_ref == event.call_ref:
-                    self.store.close_span(span_id)
-                    self._open_spans.pop((call_ref, name), None)
-                    self.store.record_anomaly(
-                        event.provider.value,
-                        "span_unclosed_at_hangup",
-                        f"{name} was still open when the call ended",
-                        call_ref,
+        if event.type is EventType.CALL_RINGING:
+            self.store.open_span(ref, "ring_to_answer", ts, attrs)
+        elif event.type is EventType.CALL_STARTED:
+            self.store.close_span(ref, "ring_to_answer", ts)
+            if event.provider in _REPORTS_AGENT_SPEECH:
+                spoke = self.store.first_event_ts(ref, EventType.AGENT_SPEECH_STARTED.value)
+                if spoke is None:
+                    self.store.open_span(ref, "answer_to_first_word", ts, attrs)
+                else:
+                    # The agent's first word was delivered before the answer event. The
+                    # span is already complete; opening it now would leave it open forever
+                    # and wrongly report an agent that never spoke.
+                    if spoke < ts:
+                        self.store.record_anomaly(
+                            event.provider.value, "clock_disagreement",
+                            f"first word timestamped {ts - spoke}ms before the call was "
+                            "answered; recording a zero-length span",
+                            ref,
+                        )
+                    self.store.record_span(
+                        ref, "answer_to_first_word", ts, max(spoke, ts),
+                        {**attrs, "delivered_out_of_order": True},
                     )
+        elif event.type is EventType.AGENT_SPEECH_STARTED:
+            self.store.close_span(ref, "answer_to_first_word", ts)
+
+        if ended_now:
+            # A span still open at the end means something: ring_to_answer means nobody
+            # picked up, answer_to_first_word means the agent never spoke.
+            for name in self.store.close_all_spans(ref, ts):
+                self.store.record_anomaly(
+                    event.provider.value, "span_open_at_end",
+                    f"{name} was still open when the call ended", ref,
+                )
 
 
-def observed_lag_summary(store: Store, call_ref: str) -> dict[str, Any]:
-    """Delivery lag per event, which is how you tell a slow provider from a slow agent.
+def delivery_lag(store: Store, call_ref: str) -> dict[str, Any]:
+    """Time from the provider's timestamp to arrival, per event.
 
-    A four-second silence on the call and a four-second webhook delivery lag are very
-    different problems with the same symptom, and only one of them is yours to fix.
+    A four-second silence on the call and a four-second webhook delay have the same
+    symptom and different owners. For Retell the provider timestamp is the signature's,
+    so a retried delivery measures its own attempt, not the original send.
     """
-    rows = store.events_for(call_ref)
-    lags = [
+    lags = sorted(
         r["received_ts_ms"] - r["provider_ts_ms"]
-        for r in rows
+        for r in store.events_for(call_ref)
         if r["provider_ts_ms"] is not None
-    ]
+    )
     return {
-        "events": len(rows),
-        "with_provider_timestamp": len(lags),
-        "max_delivery_lag_ms": max(lags) if lags else None,
-        "median_delivery_lag_ms": sorted(lags)[len(lags) // 2] if lags else None,
-        "generated_ts_ms": now_ms(),
+        "samples": len(lags),
+        "median_ms": lags[len(lags) // 2] if lags else None,
+        "max_ms": lags[-1] if lags else None,
     }

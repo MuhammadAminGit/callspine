@@ -8,3 +8,5 @@ __pycache__/
 
 # OMC runtime artifacts
 .omc/
+*.db-wal
+*.db-shm

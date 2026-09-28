@@ -1,23 +1,28 @@
 """Vapi adapter.
 
-Vapi gives you a choice of two authentication styles, and the second one has no fixed
-shape:
+Authentication. Vapi offers a shared secret (sent verbatim in `x-vapi-secret`, or as a
+bearer token) or an HMAC credential. For HMAC, Vapi's docs name the fields you configure
+(`signatureHeader`, an optional `timestampHeader`, `algorithm`, `payloadFormat`) but do not
+publish defaults, and show `x-signature` only as an example. So there is no single correct
+verifier for "a Vapi webhook", only the one matching the credential you created.
+`VapiConfig` mirrors that credential and refuses incoherent combinations at startup.
 
-- **Shared secret.** Vapi sends the value you configured, verbatim, in a header
-  (`x-vapi-secret`, or as a bearer token). Simple, and it means every request from Vapi
-  carries the same credential — capture one and you can replay it forever.
+A shared secret is replayable forever once captured, and so is an HMAC over the body
+alone, which is this adapter's default only because Vapi's timestamp header is optional.
+Configure a timestamp header and `{timestamp}.{body}` to get replay protection; the
+adapter then enforces a five-minute window.
 
-- **HMAC.** The algorithm, signature header name, timestamp header name and *payload
-  format* are all things you choose when you create the credential. Vapi's own default
-  format signs `{timestamp}.{body}`, but `{body}` alone is equally valid configuration.
+Assumptions Vapi's docs do not state, which fail closed if wrong: SHA-256 only, the
+digest is bare lowercase hex, and the timestamp header is integer milliseconds.
 
-That configurability is the trap. There is no single correct verification routine for
-"a Vapi webhook" — there is only the routine matching the credential you created. This
-adapter therefore takes the format as configuration rather than pretending a default is
-universal, and refuses to start if the pieces are inconsistent.
+Idempotency. Vapi documents no delivery id and no deduplication guidance. The keys below
+are derived from what each message means: a call passes through each status once, and
+has one end-of-call report. Transcripts and speech updates are streams and are never
+deduplicated.
 
-Compare `retell.py`, where the format is fixed and the only decision left is whether you
-remembered to enforce the replay window.
+Tools. `tool-calls` is not informational: Vapi waits for
+`{"results": [{"name", "toolCallId", "result"}]}` and speaks the result. Each tool call
+carries its own `id`, which is what makes exact replay on retry possible.
 """
 
 from __future__ import annotations
@@ -29,55 +34,58 @@ from typing import Any
 from callspine.domain import EventType, NormalizedEvent, Provider
 from callspine.providers.base import (
     SignatureError,
+    ToolInvocation,
+    body_hash_key,
     constant_time_eq,
     hmac_sha256_hex,
-    synthetic_event_id,
     within_replay_window,
 )
 
-# Vapi's message `type` field, mapped to our vocabulary. Anything absent from this map
-# is preserved as UNKNOWN rather than discarded.
-_EVENT_MAP: dict[str, EventType] = {
-    "status-update": EventType.CALL_STARTED,  # refined below by the status value
-    "speech-update": EventType.SPEECH_STARTED,
-    "transcript": EventType.TRANSCRIPT,
-    "function-call": EventType.TOOL_INVOKED,
-    "tool-calls": EventType.TOOL_INVOKED,
-    "end-of-call-report": EventType.CALL_ENDED,
-    "transfer-destination-request": EventType.TRANSFER_STARTED,
-    "hang": EventType.TRANSFER_FAILED,
-}
-
-# `status-update` carries the real lifecycle signal in a nested field.
 _STATUS_MAP: dict[str, EventType] = {
-    "queued": EventType.CALL_STARTED,
+    "scheduled": EventType.CALL_QUEUED,
+    "queued": EventType.CALL_QUEUED,
     "ringing": EventType.CALL_RINGING,
-    "in-progress": EventType.CALL_ANSWERED,
-    "forwarding": EventType.TRANSFER_STARTED,
+    "in-progress": EventType.CALL_STARTED,
+    "forwarding": EventType.TRANSFER,
     "ended": EventType.CALL_ENDED,
 }
+
+_TYPE_MAP: dict[str, EventType] = {
+    "end-of-call-report": EventType.CALL_REPORT,
+    "tool-calls": EventType.TOOL_CALL,
+    "transcript": EventType.TRANSCRIPT,
+    "conversation-update": EventType.TRANSCRIPT,
+    "speech-update": EventType.SPEECH,
+    "user-interrupted": EventType.SPEECH,
+    "transfer-update": EventType.TRANSFER,
+}
+
+_STREAM = frozenset(
+    {"transcript", "conversation-update", "speech-update", "user-interrupted"}
+)
 
 
 @dataclass
 class VapiConfig:
-    """Mirrors the credential you configured in Vapi. Getting this wrong fails closed."""
+    """Mirror of the credential configured in Vapi. Mismatch fails closed."""
 
     mode: str = "hmac"  # "hmac" or "shared_secret"
     secret: str = ""
-    signature_header: str = "x-vapi-signature"
-    timestamp_header: str = "x-timestamp"
-    # "{timestamp}.{body}" (Vapi's default) or "{body}"
-    payload_format: str = "{timestamp}.{body}"
+    signature_header: str = "x-signature"
+    timestamp_header: str = ""  # optional in Vapi; set it to get replay protection
+    payload_format: str = "{body}"  # or "{timestamp}.{body}"
     shared_secret_header: str = "x-vapi-secret"
-    enforce_replay_window: bool = True
+    replay_window_seconds: int = 300
 
     def __post_init__(self) -> None:
+        self.signature_header = self.signature_header.lower()
+        self.timestamp_header = self.timestamp_header.lower()
         if self.mode not in {"hmac", "shared_secret"}:
             raise ValueError(f"unknown vapi mode {self.mode!r}")
-        if self.payload_format not in {"{timestamp}.{body}", "{body}"}:
+        if self.payload_format not in {"{body}", "{timestamp}.{body}"}:
             raise ValueError(f"unsupported vapi payload_format {self.payload_format!r}")
         if self.payload_format == "{timestamp}.{body}" and not self.timestamp_header:
-            raise ValueError("payload_format includes {timestamp} but no timestamp_header is set")
+            raise ValueError("payload_format signs a timestamp but no timestamp_header is set")
 
 
 class VapiAdapter:
@@ -94,11 +102,9 @@ class VapiAdapter:
         if cfg.mode == "shared_secret":
             presented = headers.get(cfg.shared_secret_header) or _bearer(headers)
             if presented is None:
-                raise SignatureError("missing vapi shared secret header")
+                raise SignatureError("missing vapi shared secret")
             if not constant_time_eq(presented, cfg.secret):
                 raise SignatureError("vapi shared secret mismatch")
-            # Nothing else to check. A captured request stays valid indefinitely, which
-            # is precisely why the HMAC mode exists.
             return
 
         presented_sig = headers.get(cfg.signature_header)
@@ -111,13 +117,12 @@ class VapiAdapter:
             ts = headers.get(cfg.timestamp_header)
             if not ts:
                 raise SignatureError(f"missing {cfg.timestamp_header}")
-            if cfg.enforce_replay_window:
-                try:
-                    ts_ms = int(ts)
-                except ValueError as exc:
-                    raise SignatureError("vapi timestamp header is not an integer") from exc
-                if not within_replay_window(ts_ms):
-                    raise SignatureError("vapi timestamp outside replay window")
+            try:
+                ts_ms = int(ts)
+            except ValueError as exc:
+                raise SignatureError("vapi timestamp header is not an integer") from exc
+            if not within_replay_window(ts_ms, cfg.replay_window_seconds):
+                raise SignatureError("vapi timestamp outside replay window")
             signed = ts.encode() + b"." + raw_body
 
         expected = hmac_sha256_hex(cfg.secret, signed)
@@ -127,44 +132,101 @@ class VapiAdapter:
     def normalize(
         self, raw_body: bytes, headers: dict[str, str], received_ts_ms: int
     ) -> list[NormalizedEvent]:
-        body = json.loads(raw_body)
-        message: dict[str, Any] = body.get("message") or body
-
+        message = _message(raw_body)
         raw_type = str(message.get("type", ""))
-        etype = _EVENT_MAP.get(raw_type, EventType.UNKNOWN)
+        call_ref = _call_ref(message, raw_type)
+
+        etype = _TYPE_MAP.get(raw_type, EventType.UNKNOWN)
         if raw_type == "status-update":
-            status = str(message.get("status", ""))
-            etype = _STATUS_MAP.get(status, EventType.UNKNOWN)
+            etype = _STATUS_MAP.get(str(message.get("status", "")), EventType.UNKNOWN)
+        elif (
+            raw_type == "speech-update"
+            and message.get("status") == "started"
+            and message.get("role") == "assistant"
+        ):
+            etype = EventType.AGENT_SPEECH_STARTED
 
-        call = message.get("call") or {}
-        call_ref = str(call.get("id") or message.get("callId") or "")
-        if not call_ref:
-            # Without a call reference we cannot attach this to anything. Surfacing it
-            # as an error beats inventing a call.
-            raise ValueError("vapi payload has no call id")
-
-        # Vapi does not send a per-event id, so redelivery of a byte-identical payload
-        # is the only duplicate we can reliably detect.
-        event_id = synthetic_event_id(self.name, raw_body)
-
-        provider_ts = message.get("timestamp")
-        provider_ts_ms = int(provider_ts) if isinstance(provider_ts, (int, float)) else None
-
+        ts = message.get("timestamp")
         return [
             NormalizedEvent(
                 provider=Provider.VAPI,
-                provider_event_id=event_id,
                 call_ref=call_ref,
                 type=etype,
-                provider_ts_ms=provider_ts_ms,
+                dedupe_key=_dedupe_key(raw_type, call_ref, message, raw_body),
+                provider_ts_ms=int(ts) if isinstance(ts, (int, float)) else None,
                 received_ts_ms=received_ts_ms,
-                payload={"raw_type": raw_type, "message": message},
+                raw_type=raw_type,
+                payload=message,
             )
         ]
+
+    def tool_calls(self, raw_body: bytes) -> list[ToolInvocation]:
+        """Extract the invocations from a `tool-calls` message.
+
+        `arguments` arrives as an object or as a JSON string depending on the model, so
+        both are accepted. An invocation without an id is refused: without one there is no
+        way to answer a retry with the original result.
+        """
+        message = _message(raw_body)
+        call_ref = _call_ref(message, "tool-calls")
+        out: list[ToolInvocation] = []
+        for item in message.get("toolCallList") or []:
+            fn = item.get("function") or {}
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                args = json.loads(args) if args.strip() else {}
+            tool_call_id = item.get("id")
+            if not tool_call_id or not fn.get("name"):
+                raise ValueError("vapi tool call without id or function name")
+            out.append(
+                ToolInvocation(
+                    call_ref=call_ref,
+                    name=str(fn["name"]),
+                    args=args if isinstance(args, dict) else {},
+                    invocation_id=str(tool_call_id),
+                )
+            )
+        return out
+
+
+def is_tool_call(raw_body: bytes) -> bool:
+    try:
+        return _message(raw_body).get("type") == "tool-calls"
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _message(raw_body: bytes) -> dict[str, Any]:
+    body = json.loads(raw_body)
+    message = body.get("message")
+    if not isinstance(message, dict):
+        raise TypeError("vapi payload has no message object")
+    return message
+
+
+def _call_ref(message: dict[str, Any], raw_type: str) -> str:
+    call = message.get("call") or {}
+    call_ref = str(call.get("id") or "")
+    if not call_ref:
+        raise ValueError(f"vapi {raw_type!r} message has no call.id")
+    return call_ref
+
+
+def _dedupe_key(
+    raw_type: str, call_ref: str, message: dict[str, Any], raw_body: bytes
+) -> str | None:
+    if raw_type in _STREAM:
+        return None
+    if raw_type == "status-update":
+        return f"status-update:{call_ref}:{message.get('status', '')}"
+    if raw_type == "end-of-call-report":
+        return f"end-of-call-report:{call_ref}"
+    if raw_type == "tool-calls":
+        ids = sorted(str(t.get("id", "")) for t in message.get("toolCallList") or [])
+        return f"tool-calls:{call_ref}:{','.join(ids)}"
+    return body_hash_key(raw_type, raw_body)
 
 
 def _bearer(headers: dict[str, str]) -> str | None:
     auth = headers.get("authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth[7:]
-    return None
+    return auth[7:] if auth.lower().startswith("bearer ") else None

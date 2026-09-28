@@ -1,115 +1,100 @@
-"""Signature verification, including the failure that only shows up in production."""
+"""Signature verification for both providers, including the failure that only shows in production."""
 
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
 from callspine.providers.base import SignatureError, hmac_sha256_hex
 from callspine.providers.retell import RetellAdapter, RetellConfig, parse_signature_header
 from callspine.providers.vapi import VapiAdapter, VapiConfig
+from tests.conftest import KEY, now_ms, retell_headers, vapi_headers
 
-SECRET = "shhh-not-a-real-secret"
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
+# ---- Vapi ------------------------------------------------------------------------
 
 
-# --- Vapi ------------------------------------------------------------------
+def test_vapi_hmac_body_only_default():
+    body = b'{"message":{"type":"status-update"}}'
+    VapiAdapter(VapiConfig(secret=KEY)).verify(body, vapi_headers(body))
 
 
-def test_vapi_shared_secret_accepts_matching_header():
-    adapter = VapiAdapter(VapiConfig(mode="shared_secret", secret=SECRET))
-    adapter.verify(b"{}", {"x-vapi-secret": SECRET})
+def test_vapi_hmac_rejects_wrong_secret():
+    body = b'{"message":{}}'
+    with pytest.raises(SignatureError, match="mismatch"):
+        VapiAdapter(VapiConfig(secret=KEY)).verify(body, vapi_headers(body, secret="other"))
 
 
-def test_vapi_shared_secret_accepts_bearer():
-    adapter = VapiAdapter(VapiConfig(mode="shared_secret", secret=SECRET))
-    adapter.verify(b"{}", {"authorization": f"Bearer {SECRET}"})
+def test_vapi_signature_header_is_whatever_the_credential_says():
+    """Vapi publishes no default header, so the configured one is the only one accepted."""
+    body = b"{}"
+    adapter = VapiAdapter(VapiConfig(secret=KEY, signature_header="X-Hook-Sig"))
+    adapter.verify(body, {"x-hook-sig": hmac_sha256_hex(KEY, body)})
+    with pytest.raises(SignatureError, match="missing"):
+        adapter.verify(body, vapi_headers(body))
 
 
-def test_vapi_shared_secret_rejects_wrong_value():
-    adapter = VapiAdapter(VapiConfig(mode="shared_secret", secret=SECRET))
+def test_vapi_timestamped_format_roundtrip():
+    cfg = VapiConfig(secret=KEY, timestamp_header="x-timestamp", payload_format="{timestamp}.{body}")
+    body, ts = b'{"a":1}', str(now_ms())
+    sig = hmac_sha256_hex(KEY, ts.encode() + b"." + body)
+    VapiAdapter(cfg).verify(body, {"x-signature": sig, "x-timestamp": ts})
+
+
+def test_vapi_timestamped_format_rejects_replay():
+    cfg = VapiConfig(secret=KEY, timestamp_header="x-timestamp", payload_format="{timestamp}.{body}")
+    body, ts = b"{}", str(now_ms() - 3_600_000)
+    sig = hmac_sha256_hex(KEY, ts.encode() + b"." + body)
+    with pytest.raises(SignatureError, match="replay window"):
+        VapiAdapter(cfg).verify(body, {"x-signature": sig, "x-timestamp": ts})
+
+
+def test_vapi_shared_secret_header_and_bearer():
+    adapter = VapiAdapter(VapiConfig(mode="shared_secret", secret=KEY))
+    adapter.verify(b"{}", {"x-vapi-secret": KEY})
+    adapter.verify(b"{}", {"authorization": f"Bearer {KEY}"})
     with pytest.raises(SignatureError):
         adapter.verify(b"{}", {"x-vapi-secret": "wrong"})
 
 
-def test_vapi_hmac_timestamped_roundtrip():
-    adapter = VapiAdapter(VapiConfig(mode="hmac", secret=SECRET))
-    body = b'{"message":{"type":"status-update"}}'
-    ts = str(_now_ms())
-    sig = hmac_sha256_hex(SECRET, ts.encode() + b"." + body)
-    adapter.verify(body, {"x-vapi-signature": sig, "x-timestamp": ts})
-
-
-def test_vapi_hmac_rejects_stale_timestamp():
-    adapter = VapiAdapter(VapiConfig(mode="hmac", secret=SECRET))
-    body = b"{}"
-    ts = str(_now_ms() - 3_600_000)  # an hour old
-    sig = hmac_sha256_hex(SECRET, ts.encode() + b"." + body)
-    with pytest.raises(SignatureError, match="replay window"):
-        adapter.verify(body, {"x-vapi-signature": sig, "x-timestamp": ts})
-
-
-def test_vapi_body_only_format_ignores_timestamp():
-    adapter = VapiAdapter(VapiConfig(mode="hmac", secret=SECRET, payload_format="{body}"))
-    body = b'{"a":1}'
-    adapter.verify(body, {"x-vapi-signature": hmac_sha256_hex(SECRET, body)})
-
-
-def test_vapi_config_rejects_incoherent_setup():
+def test_vapi_config_refuses_incoherent_credentials():
     with pytest.raises(ValueError):
         VapiConfig(payload_format="{timestamp}.{body}", timestamp_header="")
     with pytest.raises(ValueError):
         VapiConfig(mode="magic")
 
 
-# --- Retell ----------------------------------------------------------------
-
-
-def _retell_headers(body: bytes, key: str, ts_ms: int | None = None) -> dict[str, str]:
-    ts_ms = ts_ms if ts_ms is not None else _now_ms()
-    digest = hmac_sha256_hex(key, body + str(ts_ms).encode())
-    return {"x-retell-signature": f"v={ts_ms},d={digest}"}
+# ---- Retell ----------------------------------------------------------------------
 
 
 def test_retell_roundtrip():
-    adapter = RetellAdapter(RetellConfig(api_key=SECRET))
     body = b'{"event":"call_started","call":{"call_id":"c1"}}'
-    adapter.verify(body, _retell_headers(body, SECRET))
+    RetellAdapter(RetellConfig(api_key=KEY)).verify(body, retell_headers(body))
 
 
 def test_retell_rejects_tampered_body():
-    adapter = RetellAdapter(RetellConfig(api_key=SECRET))
     body = b'{"event":"call_started","call":{"call_id":"c1"}}'
-    headers = _retell_headers(body, SECRET)
-    with pytest.raises(SignatureError):
-        adapter.verify(body.replace(b"c1", b"c2"), headers)
+    headers = retell_headers(body)
+    with pytest.raises(SignatureError, match="mismatch"):
+        RetellAdapter(RetellConfig(api_key=KEY)).verify(body.replace(b"c1", b"c2"), headers)
 
 
-def test_retell_enforces_replay_window_by_default():
-    adapter = RetellAdapter(RetellConfig(api_key=SECRET))
+def test_retell_enforces_documented_five_minute_window():
     body = b"{}"
-    old = _now_ms() - 3_600_000
+    adapter = RetellAdapter(RetellConfig(api_key=KEY))
+    adapter.verify(body, retell_headers(body, ts_ms=now_ms() - 240_000))
     with pytest.raises(SignatureError, match="replay window"):
-        adapter.verify(body, _retell_headers(body, SECRET, ts_ms=old))
+        adapter.verify(body, retell_headers(body, ts_ms=now_ms() - 360_000))
 
 
-def test_retell_replay_window_can_be_disabled_explicitly():
-    """Disabling is allowed but must be a deliberate act, never a silent default."""
-    adapter = RetellAdapter(RetellConfig(api_key=SECRET, enforce_replay_window=False))
+def test_retell_window_can_only_be_disabled_explicitly():
     body = b"{}"
-    old = _now_ms() - 3_600_000
-    adapter.verify(body, _retell_headers(body, SECRET, ts_ms=old))
+    adapter = RetellAdapter(RetellConfig(api_key=KEY, enforce_replay_window=False))
+    adapter.verify(body, retell_headers(body, ts_ms=now_ms() - 3_600_000))
 
 
-def test_retell_signature_parser_tolerates_spacing_and_order():
-    ts, digest = parse_signature_header("d=abc123 , v=1700000000000")
-    assert ts == 1700000000000
-    assert digest == "abc123"
+def test_retell_signature_parser_tolerates_order_and_spacing():
+    assert parse_signature_header("d=abc123 , v=1700000000000") == (1700000000000, "abc123")
 
 
 def test_retell_signature_parser_rejects_incomplete_header():
@@ -117,27 +102,22 @@ def test_retell_signature_parser_rejects_incomplete_header():
         parse_signature_header("v=123")
 
 
-# --- The one that matters --------------------------------------------------
+# ---- The one that matters ------------------------------------------------------------
 
 
 def test_reserialised_json_breaks_the_signature():
-    """Why adapters take raw bytes and never a parsed dict.
+    """Why every adapter takes raw bytes, never a parsed dict.
 
-    A caller named Zoë is enough to break a verifier that re-serialises the body before
-    hashing. `json.dumps` escapes the non-ASCII character and changes the separators, so
-    the bytes signed by the provider and the bytes hashed by the server differ.
-
-    This test exists to pin that behaviour, because it passes in every test suite that
-    only ever uses ASCII names and fails on the first real call.
+    Retell's docs warn about this. A caller named Zoë is enough: `json.dumps` escapes the
+    character and changes separators, so the bytes the provider signed and the bytes the
+    server hashes differ. This passes in any suite that only uses ASCII names.
     """
     original = '{"caller":"Zoë","amount":1.0}'.encode()
     reserialised = json.dumps(json.loads(original)).encode()
-
     assert original != reserialised
-    assert hmac_sha256_hex(SECRET, original) != hmac_sha256_hex(SECRET, reserialised)
 
-    adapter = RetellAdapter(RetellConfig(api_key=SECRET))
-    headers = _retell_headers(original, SECRET)
-    adapter.verify(original, headers)  # raw bytes: fine
+    adapter = RetellAdapter(RetellConfig(api_key=KEY))
+    headers = retell_headers(original)
+    adapter.verify(original, headers)
     with pytest.raises(SignatureError):
-        adapter.verify(reserialised, headers)  # round-tripped: broken
+        adapter.verify(reserialised, headers)
